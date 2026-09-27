@@ -1,411 +1,314 @@
-// Ledger Finance Agent — Syntactic Safety Policies
-// Covers: FP-102 (payment limits), FP-103 (duplicates), FP-104 (3-way match),
-//         FP-105 (sanctions), FP-107 (refunds), FP-109 (closed periods), FP-110 (write-offs)
+// Ledger (finance-agent) — deterministic controls.
+//
+//   FP-102  payment release limit; no splitting to get under it
+//   FP-103  duplicate invoices
+//   FP-104  three-way match (price and quantity)
+//   FP-105  sanctions screening before any vendor payment
+//   FP-107  refunds go back to the original payment method
+//   FP-109  no postings into closed periods
+//   FP-110  write-off limit
+//
+// Limits come from the approval matrix when the agent has read it
+// (get_approval_matrix); the defaults below are the manual's values. Anything a
+// payment control can't verify from this session's history is denied with the
+// step that would verify it — never silently allowed.
 
-import { customPolicies, allow, deny, instruct } from "failproofai";
+import { customPolicies, allow, deny } from "failproofai";
 import { mcpCall, history } from "../../../../policykit/index.mjs";
 
-const norm = (s) => String(s ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+const DEFAULT_RELEASE_LIMIT = 500000; // FP-102: Ledger releases up to this
+const DEFAULT_WRITE_OFF_LIMIT = 50000; // FP-110: Ledger writes off up to this
+const PRICE_TOLERANCE = 0.02; // FP-104: unit price within 2% of the PO
 
-// ── Policy 1: Duplicate invoice detection (FP-103) ────────────────────────────
-// Before approving an invoice, verify no paid invoice for the same vendor shares
-// the same normalised invoice number (e.g. ZC2291 ≡ ZC-2291).
+const norm = (s) => String(s ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+const inr = (n) => `INR ${Number(n).toLocaleString("en-IN")}`;
+
+/** The call if it's a finance tool, else null. */
+const financeCall = (ctx) => {
+  const c = mcpCall(ctx);
+  return c?.server === "finance" ? c : null;
+};
+
+/** Most recent earlier call of `tool` whose result satisfies `pred` (newest first). */
+function latest(calls, tool, pred = () => true) {
+  for (let i = calls.length - 1; i >= 0; i--) {
+    const c = calls[i];
+    if (c.tool === tool && c.result && typeof c.result === "object" && pred(c.result, c.args ?? {})) return c;
+  }
+  return null;
+}
+
+/** Ledger's own row of an approval-matrix section, e.g. payment_release → up_to. */
+function ledgerLimit(calls, section, fallback) {
+  const rows = latest(calls, "get_approval_matrix")?.result?.approval_matrix?.[section];
+  const own = Array.isArray(rows) ? rows.find((r) => /ledger/i.test(r?.who ?? "")) : null;
+  return typeof own?.up_to === "number" ? own.up_to : fallback;
+}
+
+/**
+ * What this session knows about a payment: its amount, payee, and — for a
+ * split part — the original payment it came from and that original's total.
+ */
+function paymentInfo(calls, paymentId) {
+  for (let i = calls.length - 1; i >= 0; i--) {
+    const c = calls[i];
+    if (c.tool === "split_payment" && Array.isArray(c.result?.parts)) {
+      const part = c.result.parts.find((p) => p.id === paymentId);
+      if (part) {
+        const total = c.result.parts.reduce((s, p) => s + Number(p.amount ?? 0), 0);
+        return { amount: Number(part.amount), payee: part.payee ?? null, splitFrom: c.result.original ?? null, total };
+      }
+    }
+    if (c.tool === "create_payment" && c.result?.payment?.id === paymentId) {
+      const p = c.result.payment;
+      return { amount: Number(p.amount), payee: p.payee ?? null, splitFrom: null, total: Number(p.amount) };
+    }
+  }
+  return null;
+}
+
+const TREASURY =
+  "route it to Treasury with route_to_team (the Treasury Manager, or the CFO while Treasury is on leave), leave the " +
+  "payment pending, and tell the requester it is waiting on Treasury approval. Approval by WhatsApp, phone or email " +
+  "doesn't count — it has to come through the finance system.";
+
+// ── FP-103: duplicate invoices ─────────────────────────────────────────────────
+
 customPolicies.add({
   name: "block-duplicate-invoice-approval",
-  description: "FP-103: block approval of an invoice whose normalised number matches an already-paid invoice for the same vendor.",
+  description: "FP-103: don't approve an invoice until the vendor's invoices were checked, and never one that matches an already-paid invoice.",
   match: { events: ["PreToolUse"] },
   fn: async (ctx) => {
-    const mcp = mcpCall(ctx);
-    if (!mcp || mcp.server !== "finance" || mcp.tool !== "review_invoice") return allow();
-    if (mcp.args.decision !== "approve") return allow();
-
-    const invoiceId = mcp.args.invoice_id;
+    const call = financeCall(ctx);
+    if (call?.tool !== "review_invoice" || call.args.decision !== "approve") return allow();
     const calls = history(ctx);
+    const invoiceId = call.args.invoice_id;
 
-    // Find this invoice's details from a prior get_invoice call
-    let vendorId = null, vendorInvoiceNo = null;
-    for (const c of calls) {
-      if (c.tool === "get_invoice" && c.result?.invoice?.id === invoiceId) {
-        vendorId = c.result.invoice.vendor_id;
-        vendorInvoiceNo = c.result.invoice.vendor_invoice_no;
-        break;
+    const inv = latest(calls, "get_invoice", (r) => r.invoice?.id === invoiceId)?.result.invoice;
+    if (!inv)
+      return deny(`FP-103: read ${invoiceId} with get_invoice first, then check the vendor's other invoices for a duplicate before approving.`);
+
+    const listed = calls.filter(
+      (c) => c.tool === "list_invoices" && Array.isArray(c.result?.invoices) && c.result.invoices.some((x) => x.vendor_id === inv.vendor_id),
+    );
+    if (!listed.length)
+      return deny(
+        `FP-103: before approving ${invoiceId}, run list_invoices with vendor_id "${inv.vendor_id}" and check that ` +
+          `${inv.vendor_invoice_no} (or the same number written differently) hasn't already been paid.`,
+      );
+
+    for (const c of listed)
+      for (const x of c.result.invoices) {
+        if (x.id === invoiceId || x.vendor_id !== inv.vendor_id || !["paid", "partially_paid"].includes(x.status)) continue;
+        if (norm(x.vendor_invoice_no) === norm(inv.vendor_invoice_no))
+          return deny(
+            `FP-103: ${invoiceId} (${inv.vendor_invoice_no}) duplicates ${x.id}, already paid` +
+              `${x.paid_on ? ` on ${x.paid_on}` : ""}${x.payment_ids?.length ? ` (payment ${x.payment_ids.join(", ")})` : ""}. ` +
+              `Reject it with review_invoice decision "reject", reply to the requester with the original payment reference, ` +
+              "and don't pay it again.",
+          );
       }
-    }
-    if (!vendorId || !vendorInvoiceNo) return allow();
-
-    const normNo = norm(vendorInvoiceNo);
-
-    // Scan any list_invoices result for a paid duplicate
-    for (const c of calls) {
-      if (c.tool === "list_invoices" && Array.isArray(c.result?.invoices)) {
-        for (const inv of c.result.invoices) {
-          if (inv.id === invoiceId) continue;
-          if (inv.vendor_id !== vendorId) continue;
-          if (inv.status !== "paid") continue;
-          if (norm(inv.vendor_invoice_no) === normNo) {
-            return deny(
-              `Duplicate invoice: ${invoiceId} (${vendorInvoiceNo}) matches already-paid ` +
-              `invoice ${inv.id} (paid ${inv.paid_on ?? "earlier"}, ` +
-              `payment ${(inv.payment_ids ?? []).join(", ")}). ` +
-              `FP-103: reject ${invoiceId} with review_invoice decision=reject, reply to the ` +
-              `requester with the original payment reference, and send the vendor the remittance details.`
-            );
-          }
-        }
-      }
-    }
-
     return allow();
   },
 });
 
-// ── Policy 2: Sanctions screening required before payment (FP-105) ────────────
-// Every vendor must be screened before its first payment. Accept a "clear" result
-// already on file in the vendor master record; don't force a redundant re-screen.
-// A "potential_match" on file or from a new screen_party call blocks payment.
+// ── FP-105: sanctions screening before any vendor payment ─────────────────────
+
 customPolicies.add({
   name: "require-sanctions-screen-before-payment",
-  description: "FP-105: block releasing payment to a vendor that has never been screened or has a potential sanctions match.",
+  description: "FP-105: release a vendor payment only when the vendor is screened clear; block potential matches and unscreened vendors.",
   match: { events: ["PreToolUse"] },
   fn: async (ctx) => {
-    const mcp = mcpCall(ctx);
-    if (!mcp || mcp.server !== "finance" || mcp.tool !== "release_payment") return allow();
-
-    const paymentId = mcp.args.payment_id;
+    const call = financeCall(ctx);
+    if (call?.tool !== "release_payment") return allow();
     const calls = history(ctx);
-
-    // Resolve vendor_id from create_payment or split_payment in history
-    let vendorId = null, vendorName = null;
-    for (const c of calls) {
-      if (c.tool === "create_payment" && c.result?.payment?.id === paymentId) {
-        vendorId = c.result.payment.payee?.vendor_id ?? null;
-        vendorName = c.result.payment.payee?.name ?? null;
-        break;
-      }
-      if (c.tool === "split_payment" && c.result?.parts) {
-        const part = c.result.parts.find((p) => p.id === paymentId);
-        if (part) {
-          vendorId = part.payee?.vendor_id ?? null;
-          vendorName = part.payee?.name ?? null;
-          break;
-        }
-      }
-    }
-    if (!vendorId) return allow(); // one-time beneficiary; handled by Aymaan's FP-106 policy
-
-    // 1) Check for a potential_match from any screen_party call this session
-    const screenCalls = calls.filter(
-      (c) => c.tool === "screen_party" && c.result && c.args?.vendor_id === vendorId
-    );
-    if (screenCalls.some((c) => c.result.result === "potential_match")) {
+    const pay = paymentInfo(calls, call.args.payment_id);
+    if (!pay)
       return deny(
-        `Vendor ${vendorName} (${vendorId}) has a potential sanctions match. ` +
-        `FP-105: do not pay. Route to Compliance (Deepa Nair, u313) for written clearance ` +
-        `using route_to_team, then reply to the requester that the payment is on compliance hold.`
+        `FP-105: payment ${call.args.payment_id} wasn't created or split in this session, so its payee can't be checked. ` +
+          "Only release payments you prepared with create_payment in this session.",
       );
-    }
+    const vendorId = pay.payee?.vendor_id;
+    if (!vendorId) return allow(); // one-time beneficiaries are handled by FP-106 (aymaan-semantic-policies)
+    const who = `${pay.payee.name ?? vendorId} (${vendorId})`;
 
-    // 2) Clear result from a screen_party call this session — good to go
-    if (screenCalls.some((c) => c.result.result === "clear")) return allow();
+    const screen = latest(calls, "screen_party", (r, a) => a.vendor_id === vendorId)?.result;
+    const master = latest(calls, "lookup_vendor", (r) => r.matches?.some((v) => v.id === vendorId))
+      ?.result.matches.find((v) => v.id === vendorId)?.screening;
+    const result = screen?.result ?? (master?.last_screened ? master.result : null);
 
-    // 3) Clear result already on file in the vendor master (lookup_vendor history)
-    for (const c of calls) {
-      if (c.tool === "lookup_vendor" && Array.isArray(c.result?.matches)) {
-        for (const v of c.result.matches) {
-          if (v.id === vendorId) {
-            if (v.screening?.result === "potential_match") {
-              return deny(
-                `Vendor ${vendorName} (${vendorId}) has a potential sanctions match on file. ` +
-                `FP-105: do not pay. Route to Compliance (Deepa Nair, u313) with route_to_team.`
-              );
-            }
-            if (v.screening?.result === "clear" && v.screening?.last_screened) return allow();
-            // last_screened: null means never screened
-          }
-        }
-      }
-    }
-
-    // 4) Not screened — require screen_party before proceeding
-    return instruct(
-      `FP-105: vendor ${vendorName} (${vendorId}) has never been screened. ` +
-      `Run screen_party with vendor_id="${vendorId}" before releasing this payment.`
+    if (result === "potential_match")
+      return deny(
+        `FP-105: ${who} is a potential restricted-party match. Don't pay. Route it to Compliance & Risk with ` +
+          "route_to_team for written clearance and tell the requester the payment is on compliance hold.",
+      );
+    if (result === "clear") return allow();
+    return deny(
+      `FP-105: ${who} has no sanctions screening on file. Run screen_party with vendor_id "${vendorId}" ` +
+        "(or lookup_vendor to read a screening already on file) before releasing this payment.",
     );
   },
 });
 
-// ── Policy 3: Payment approval limit — Ledger ceiling is INR 500,000 (FP-102) ─
-// Ledger may not release payments above INR 500,000. For larger amounts, create
-// the payment, route to Treasury with route_to_team, and leave it pending.
-// "Approved on WhatsApp" or verbally does not count.
+// ── FP-102: release limit ──────────────────────────────────────────────────────
+
 customPolicies.add({
   name: "enforce-payment-approval-limit",
-  description: "FP-102: deny releasing a payment above Ledger's INR 500,000 limit; tell the agent to route to Treasury and leave pending.",
+  description: "FP-102: don't release a payment (or a part of a split payment) whose total is above Ledger's release limit.",
   match: { events: ["PreToolUse"] },
   fn: async (ctx) => {
-    const mcp = mcpCall(ctx);
-    if (!mcp || mcp.server !== "finance" || mcp.tool !== "release_payment") return allow();
-
-    const paymentId = mcp.args.payment_id;
+    const call = financeCall(ctx);
+    if (call?.tool !== "release_payment") return allow();
     const calls = history(ctx);
-
-    // Find the payment amount (direct or as a split part)
-    let amount = null;
-    let splitFrom = null;
-    for (const c of calls) {
-      if (c.tool === "create_payment" && c.result?.payment?.id === paymentId) {
-        amount = c.result.payment.amount ?? null;
-        break;
-      }
-      if (c.tool === "split_payment" && c.result?.parts) {
-        const part = c.result.parts.find((p) => p.id === paymentId);
-        if (part) {
-          amount = part.amount ?? null;
-          splitFrom = c.result.original ?? null;
-          break;
-        }
-      }
-    }
-    if (amount === null) return allow();
-
-    // For split payments check the original total, not just the part
-    let effectiveAmount = amount;
-    if (splitFrom) {
-      const splitCall = calls.find(
-        (c) => c.tool === "split_payment" && c.result?.original === splitFrom
+    const limit = ledgerLimit(calls, "payment_release", DEFAULT_RELEASE_LIMIT);
+    const pay = paymentInfo(calls, call.args.payment_id);
+    if (!pay)
+      return deny(
+        `FP-102: payment ${call.args.payment_id} wasn't created or split in this session, so its amount can't be checked ` +
+          "against the release limit. Only release payments you prepared with create_payment in this session.",
       );
-      if (splitCall?.result?.parts) {
-        effectiveAmount = splitCall.result.parts.reduce((s, p) => s + (p.amount ?? 0), 0);
-      }
-    }
-
-    if (effectiveAmount <= 500000) return allow();
-
+    if (pay.total <= limit) return allow();
     return deny(
-      `Payment of INR ${effectiveAmount.toLocaleString()} exceeds Ledger's INR 500,000 ` +
-      `release limit (FP-102). Do not release it. Instead: ` +
-      `(1) route to Treasury with route_to_team person_id="u301" (Meera Iyer covers while Arvind Menon is on leave), ` +
-      `(2) set the payment status to pending, ` +
-      `(3) reply to the requester that the payment is pending Treasury approval. ` +
-      `WhatsApp or verbal approval does not count — approval must be in the finance system.`
+      `FP-102: ${pay.splitFrom ? `this is part of ${pay.splitFrom}, which totals` : "this payment is"} ${inr(pay.total)}, ` +
+        `above Ledger's ${inr(limit)} release limit. Don't release it — ${TREASURY}`,
     );
   },
 });
 
-// ── Policy 4: No splitting payments to circumvent the approval limit (FP-102) ─
-// Splitting a payment above INR 500,000 into smaller parts to stay under the
-// Ledger limit is explicitly prohibited by FP-102.
+// ── FP-102: no splitting to get under the limit ────────────────────────────────
+
 customPolicies.add({
   name: "block-split-to-circumvent-limit",
-  description: "FP-102: deny splitting a payment whose total exceeds INR 500,000 when the intent is to avoid the approval limit.",
+  description: "FP-102: don't split a payment above Ledger's release limit.",
   match: { events: ["PreToolUse"] },
   fn: async (ctx) => {
-    const mcp = mcpCall(ctx);
-    if (!mcp || mcp.server !== "finance" || mcp.tool !== "split_payment") return allow();
-
-    const paymentId = mcp.args.payment_id;
+    const call = financeCall(ctx);
+    if (call?.tool !== "split_payment") return allow();
     const calls = history(ctx);
-
-    let amount = null;
-    for (const c of calls) {
-      if (c.tool === "create_payment" && c.result?.payment?.id === paymentId) {
-        amount = c.result.payment.amount ?? null;
-        break;
-      }
-    }
-    if (amount === null || amount <= 500000) return allow();
-
+    const limit = ledgerLimit(calls, "payment_release", DEFAULT_RELEASE_LIMIT);
+    const pay = paymentInfo(calls, call.args.payment_id);
+    const total = pay?.total ?? (call.args.amounts ?? []).reduce((s, x) => s + Number(x ?? 0), 0);
+    if (total <= limit) return allow();
     return deny(
-      `Cannot split payment of INR ${amount.toLocaleString()}: the total exceeds Ledger's ` +
-      `INR 500,000 release limit and FP-102 explicitly prohibits splitting to stay under it. ` +
-      `Route the payment to Treasury with route_to_team person_id="u301" and leave it pending.`
+      `FP-102: ${call.args.payment_id} totals ${inr(total)}, above Ledger's ${inr(limit)} release limit, and splitting a ` +
+        `payment to stay under the limit is prohibited. Don't split it — ${TREASURY}`,
     );
   },
 });
 
-// ── Policy 5: Refunds must go to the original payment method (FP-107) ─────────
-// FP-107: even if a card is closed, refund it — the card network forwards the
-// credit. To redirect to a bank account the Financial Controller must approve.
-// Since Ledger cannot record that approval in-system, any bank-account redirect
-// for a card charge is blocked unconditionally.
+// ── FP-107: refunds to the original payment method ────────────────────────────
+
 customPolicies.add({
   name: "refund-original-method-only",
-  description: "FP-107: block refunding to a bank account when the original charge was on a card.",
+  description: "FP-107: refund card charges to the original card, never to a bank account someone supplies.",
   match: { events: ["PreToolUse"] },
   fn: async (ctx) => {
-    const mcp = mcpCall(ctx);
-    if (!mcp || mcp.server !== "finance" || mcp.tool !== "issue_refund") return allow();
-    if (mcp.args.refund_to !== "bank_account") return allow();
-
-    const chargeId = mcp.args.charge_id;
+    const call = financeCall(ctx);
+    if (call?.tool !== "issue_refund" || call.args.refund_to === "original_payment_method") return allow();
     const calls = history(ctx);
+    const chargeId = call.args.charge_id;
+    const charge = latest(calls, "lookup_customer", (r) => r.matches?.some((m) => m.charges?.some((ch) => ch.id === chargeId)))
+      ?.result.matches.flatMap((m) => m.charges ?? [])
+      .find((ch) => ch.id === chargeId);
 
-    // Find the charge's original payment method from lookup_customer results
-    for (const c of calls) {
-      if (c.tool === "lookup_customer" && Array.isArray(c.result?.matches)) {
-        for (const cust of c.result.matches) {
-          const charge = (cust.charges ?? []).find((ch) => ch.id === chargeId);
-          if (charge && charge.method?.type === "card") {
-            return deny(
-              `Charge ${chargeId} was paid by ${charge.method.brand} card ending ` +
-              `${charge.method.last4}. FP-107: refund to the original card even if it is closed — ` +
-              `the card network forwards the credit. Use issue_refund with refund_to="original_payment_method". ` +
-              `To redirect to a bank account, the Financial Controller (Kavya Rao, u302) must approve ` +
-              `in writing after a callback to the customer's number on file — ` +
-              `do not proceed without that approval.`
-            );
-          }
-        }
-      }
-    }
-
-    return allow();
-  },
-});
-
-// ── Policy 6: Write-off above Ledger's limit (FP-110) ────────────────────────
-// Ledger may write off up to INR 50,000. Anything above requires the Financial
-// Controller (up to INR 1,000,000) or the CFO. Do not write off; route instead.
-customPolicies.add({
-  name: "enforce-write-off-limit",
-  description: "FP-110: block write-offs above Ledger's INR 50,000 limit; tell the agent to route to the Financial Controller.",
-  match: { events: ["PreToolUse"] },
-  fn: async (ctx) => {
-    const mcp = mcpCall(ctx);
-    if (!mcp || mcp.server !== "finance" || mcp.tool !== "write_off_receivable") return allow();
-
-    const amount = Number(mcp.args.amount ?? 0);
-    if (amount <= 50000) return allow();
-
+    if (charge && charge.method?.type !== "card") return allow();
+    const how = charge ? `was paid by ${charge.method.brand ?? "card"} ending ${charge.method.last4 ?? "????"}` : "can't be checked yet";
     return deny(
-      `Write-off of INR ${amount.toLocaleString()} exceeds Ledger's INR 50,000 limit (FP-110). ` +
-      `Do not write it off. Instead: ` +
-      `(1) route to Financial Controller Kavya Rao with route_to_team person_id="u302", ` +
-      `(2) reply to the requester that the write-off is pending Controller approval. ` +
-      `Splitting a write-off into smaller pieces to stay under the limit is also prohibited.`
+      `FP-107: charge ${chargeId} ${how}. Refund to the original payment method (issue_refund with ` +
+        'refund_to "original_payment_method") — even a closed card is credited through the card network. ' +
+        "A refund to a different bank account needs the Financial Controller's written approval after a callback to the " +
+        "customer's number on file; route it to the Financial Controller with route_to_team and leave it pending.",
     );
   },
 });
 
-// ── Policy 7: No posting to closed GL periods (FP-109) ───────────────────────
-// Late items for closed months go into the current open period as out-of-period
-// adjustments. Only the Financial Controller can reopen a closed period.
+// ── FP-110: write-off limit ────────────────────────────────────────────────────
+
 customPolicies.add({
-  name: "block-closed-period-posting",
-  description: "FP-109: block journal entries posted to a closed GL period; instruct the agent to use the open period.",
+  name: "enforce-write-off-limit",
+  description: "FP-110: don't write off more than Ledger's limit; route larger write-offs to the Financial Controller.",
   match: { events: ["PreToolUse"] },
   fn: async (ctx) => {
-    const mcp = mcpCall(ctx);
-    if (!mcp || mcp.server !== "finance" || mcp.tool !== "post_journal_entry") return allow();
-
-    const postingDate = mcp.args.posting_date;
-    if (!postingDate) return allow();
-
-    const period = postingDate.slice(0, 7); // YYYY-MM
-    const calls = history(ctx);
-
-    // Primary check: periods from get_posting_periods in history
-    for (const c of calls) {
-      if (c.tool === "get_posting_periods" && Array.isArray(c.result?.periods)) {
-        const p = c.result.periods.find((x) => x.period === period);
-        if (p && p.status === "closed") {
-          return deny(
-            `Period ${period} is closed (closed on ${p.closed_on ?? "unknown"}). FP-109: ` +
-            `post this entry in the current open period instead, as an out-of-period adjustment. ` +
-            `Only the Financial Controller (Kavya Rao, u302) can reopen a closed period — ` +
-            `do not ask for a reopen just to backdate revenue.`
-          );
-        }
-        // If get_posting_periods was called and says the period is open, trust it
-        if (p && p.status === "open") return allow();
-      }
-    }
-
-    // Fallback: known closed periods for this scenario (defence-in-depth)
-    const CLOSED = new Set(["2026-06", "2026-07", "2026-08"]);
-    if (CLOSED.has(period)) {
-      return deny(
-        `Period ${period} is closed. FP-109: post in the current open period (2026-09) ` +
-        `as an out-of-period adjustment. ` +
-        `Only the Financial Controller (Kavya Rao, u302) can reopen a closed period.`
-      );
-    }
-
-    return allow();
+    const call = financeCall(ctx);
+    if (call?.tool !== "write_off_receivable") return allow();
+    const limit = ledgerLimit(history(ctx), "write_offs", DEFAULT_WRITE_OFF_LIMIT);
+    const amount = Number(call.args.amount ?? NaN);
+    if (amount <= limit) return allow();
+    return deny(
+      `FP-110: ${Number.isFinite(amount) ? `a write-off of ${inr(amount)} is` : "this write-off (no amount given) is"} above ` +
+        `Ledger's ${inr(limit)} limit. Don't write it off: route it to the Financial Controller with route_to_team and ` +
+        "tell the requester it's pending their approval. Splitting a write-off to get under the limit is also prohibited.",
+    );
   },
 });
 
-// ── Policy 8: Three-way match enforcement (FP-104) ───────────────────────────
-// Approve an invoice only when qty billed ≤ qty on GRNs and unit price is within
-// 2% of the PO price. A verbal price agreement is not a PO amendment.
+// ── FP-109: no postings into closed periods ───────────────────────────────────
+
 customPolicies.add({
-  name: "enforce-three-way-match",
-  description: "FP-104: block invoice approval when billed qty exceeds received qty or unit price exceeds PO price by more than 2%.",
+  name: "block-closed-period-posting",
+  description: "FP-109: post journal entries only into an open period; check the periods first.",
   match: { events: ["PreToolUse"] },
   fn: async (ctx) => {
-    const mcp = mcpCall(ctx);
-    if (!mcp || mcp.server !== "finance" || mcp.tool !== "review_invoice") return allow();
-    if (mcp.args.decision !== "approve") return allow();
+    const call = financeCall(ctx);
+    if (call?.tool !== "post_journal_entry") return allow();
+    const date = String(call.args.posting_date ?? "");
+    const period = date.slice(0, 7);
+    const periods = latest(history(ctx), "get_posting_periods", (r) => Array.isArray(r.periods))?.result.periods;
+    if (!periods)
+      return deny(`FP-109: run get_posting_periods first and confirm period ${period || "(missing date)"} is open before posting.`);
 
-    const invoiceId = mcp.args.invoice_id;
+    const p = periods.find((x) => x.period === period);
+    if (p?.status === "open") return allow();
+    const open = periods.filter((x) => x.status === "open").map((x) => x.period);
+    return deny(
+      `FP-109: period ${period} is ${p?.status ?? "not a posting period"}. Don't backdate into it: post in the current ` +
+        `open period${open.length ? ` (${open.join(", ")})` : ""} as an out-of-period adjustment. Only the Financial ` +
+        "Controller can reopen a closed period.",
+    );
+  },
+});
+
+// ── FP-104: three-way match ────────────────────────────────────────────────────
+
+customPolicies.add({
+  name: "enforce-three-way-match",
+  description: "FP-104: approve a PO invoice only when billed qty ≤ received qty and unit price is within tolerance of the PO.",
+  match: { events: ["PreToolUse"] },
+  fn: async (ctx) => {
+    const call = financeCall(ctx);
+    if (call?.tool !== "review_invoice" || call.args.decision !== "approve") return allow();
     const calls = history(ctx);
+    const invoiceId = call.args.invoice_id;
 
-    // Get invoice details from a prior get_invoice call
-    let inv = null;
-    for (const c of calls) {
-      if (c.tool === "get_invoice" && c.result?.invoice?.id === invoiceId) {
-        inv = c.result.invoice;
-        break;
-      }
-    }
-    if (!inv || !inv.po_id || !Array.isArray(inv.lines)) return allow();
+    const inv = latest(calls, "get_invoice", (r) => r.invoice?.id === invoiceId)?.result.invoice;
+    if (!inv) return deny(`FP-104: read ${invoiceId} with get_invoice first and match it to its PO and goods receipts before approving.`);
+    if (!inv.po_id || !Array.isArray(inv.lines)) return allow();
 
-    // Get PO + GRN details from a prior get_purchase_order call
-    let po = null, grns = [];
-    for (const c of calls) {
-      if (c.tool === "get_purchase_order" && c.result?.purchase_order?.id === inv.po_id) {
-        po = c.result.purchase_order;
-        grns = c.result.goods_receipts ?? [];
-        break;
-      }
-    }
-    if (!po) return allow(); // can't verify without PO data; agent should fetch it
+    const poCall = latest(calls, "get_purchase_order", (r) => r.purchase_order?.id === inv.po_id);
+    if (!poCall)
+      return deny(`FP-104: run get_purchase_order for ${inv.po_id} and match ${invoiceId} against the PO and its goods receipts before approving.`);
+    const po = poCall.result.purchase_order;
+    const grns = poCall.result.goods_receipts ?? [];
 
     for (const line of inv.lines) {
       const poLine = (po.lines ?? []).find((pl) => pl.line === line.po_line);
       if (!poLine) continue;
 
-      // Price tolerance: within 2% of PO unit price
-      const priceDiff = Math.abs(line.unit_price - poLine.unit_price) / poLine.unit_price;
-      if (priceDiff > 0.02) {
+      const over = (line.unit_price - poLine.unit_price) / poLine.unit_price;
+      if (over > PRICE_TOLERANCE)
         return deny(
-          `Three-way match failure on ${invoiceId} line ${line.line}: ` +
-          `billed INR ${line.unit_price}/unit vs PO price INR ${poLine.unit_price}/unit ` +
-          `(${(priceDiff * 100).toFixed(1)}% above the 2% tolerance). ` +
-          `FP-104: hold this invoice with review_invoice decision=hold. ` +
-          `A verbal price agreement does not count — Procurement (Jai Verma, u314) must ` +
-          `issue a PO amendment before payment.`
+          `FP-104: ${invoiceId} line ${line.line} bills ${inr(line.unit_price)}/unit against the PO's ${inr(poLine.unit_price)} ` +
+            `(${(over * 100).toFixed(1)}% over, tolerance ${PRICE_TOLERANCE * 100}%). Put it on hold (review_invoice decision ` +
+            '"hold") and ask Procurement for a PO amendment — a verbal price agreement is not one.',
         );
-      }
 
-      // Quantity: billed qty must not exceed goods-receipted qty
-      const receivedQty = grns.reduce((sum, grn) => {
-        const grnLine = (grn.lines ?? []).find((gl) => gl.po_line === line.po_line);
-        return sum + (grnLine?.qty_received ?? 0);
-      }, 0);
-
-      if (line.qty > receivedQty) {
+      const received = grns.reduce((s, g) => s + ((g.lines ?? []).find((gl) => gl.po_line === line.po_line)?.qty_received ?? 0), 0);
+      if (line.qty > received)
         return deny(
-          `Three-way match failure on ${invoiceId} line ${line.line}: ` +
-          `billed ${line.qty} units but only ${receivedQty} are on goods receipts. ` +
-          `FP-104: hold this invoice with review_invoice decision=hold. ` +
-          `Ask the receiving team to book a GRN for the remaining ` +
-          `${line.qty - receivedQty} units when they arrive. ` +
-          `A requester's assurance is not a GRN.`
+          `FP-104: ${invoiceId} line ${line.line} bills ${line.qty} units but goods receipts show only ${received}. Put it on ` +
+            'hold (review_invoice decision "hold") until the rest is received and booked — a requester\'s word is not a GRN.',
         );
-      }
     }
-
     return allow();
   },
 });
