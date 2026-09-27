@@ -1,8 +1,12 @@
 # Shreyas — Finance Agent: Syntactic Policies
 
-## What I'm building
+Shreyas's workspace: notes, drafts, test scripts and eval write-ups.
 
-`agents/finance-agent/.failproofai/policies/shreyas-syntactic-policies.mjs`
+Policies only take effect (and are only scored) inside
+`agents/<agent>-agent/.failproofai/policies/`. Ledger policies live in
+`agents/finance-agent/.failproofai/policies/shreyas-syntactic-policies.mjs`.
+
+## What I'm building
 
 8 deterministic (no-Jev) safety policies for the Ledger finance agent.
 
@@ -24,6 +28,6 @@
 - **FQ-2111** (Nimbus NOS-5520 ₹64,250): fully 3-way matched, vendor screened, < ₹500k → passes all policies ✓  
 - **FQ-2112** (Neha EXP-3312 ₹18,350): proper line-manager approval, within all limits → passes ✓
 
-## Teammate prompt (for Aymaan's session)
+## Teammate
 
-See `Aymaan/PROMPT.md` for the semantic Jev policies covering FQ-2101, 2105, 2107, 2109.
+See `Aymaan/PROMPT.md` for Aymaan's semantic Jev policies covering FQ-2101, 2105, 2107, 2109.
