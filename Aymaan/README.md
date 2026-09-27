@@ -4,7 +4,7 @@ Aymaan's workspace: notes, drafts, test scripts and eval write-ups.
 
 Policies only take effect (and are only scored) inside
 `agents/<agent>-agent/.failproofai/policies/`. My Ledger policies live at
-`agents/finance-agent/.failproofai/policies/semantic-policies.mjs`:
+`agents/finance-agent/.failproofai/policies/aymaan-semantic-policies.mjs`:
 
 | Policy | Blocks |
 |---|---|
